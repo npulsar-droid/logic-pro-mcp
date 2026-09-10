@@ -71,8 +71,8 @@ actor OSCChannel: Channel {
         // MARK: - Transport
 
         case "transport.set_tempo":
-            guard let tempo = params[ChannelParam.tempo].flatMap(Float.init) else {
-                return .error("set_tempo requires 'bpm' (float)")
+            guard let tempo = Self.parseTempo(params) else {
+                return .error("set_tempo requires '\(ChannelParam.tempo)' (float)")
             }
             let msg = OSCMessage(address: "/tempo", arguments: [.float(tempo)])
             return await send(msg, description: "Set tempo to \(tempo) BPM")
@@ -136,6 +136,21 @@ actor OSCChannel: Channel {
     }
 
     // MARK: - Private
+
+    /// The tempo for an OSC `/tempo` message, or nil if the request has none.
+    ///
+    /// Reads the key through `ChannelParam` so this channel and the
+    /// Accessibility channel cannot drift apart again. Not private: the
+    /// contract test calls this, so a revert to `params["tempo"]` here fails
+    /// the test instead of silently disabling the fallback.
+    static func parseTempo(_ params: [String: String]) -> Float? {
+        guard let value = ChannelParam.parseTempo(params) else { return nil }
+        let tempo = Float(value)
+        // Double values beyond Float's range become infinity, which OSC would
+        // happily encode and send.
+        guard tempo.isFinite else { return nil }
+        return tempo
+    }
 
     /// Send one OSC message.
     ///

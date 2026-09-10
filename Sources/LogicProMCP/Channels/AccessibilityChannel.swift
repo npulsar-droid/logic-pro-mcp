@@ -245,8 +245,7 @@ actor AccessibilityChannel: Channel {
     /// dispatcher's key to the one this channel reads, which is the check that
     /// would have caught the original mismatch.
     static func parseTempo(_ params: [String: String]) -> Double? {
-        guard let raw = params[ChannelParam.tempo] ?? params["tempo"] else { return nil }
-        return Double(raw)
+        ChannelParam.parseTempo(params)
     }
 
     /// Half a BPM: the slider reports whole numbers, so anything closer than
@@ -307,7 +306,11 @@ actor AccessibilityChannel: Channel {
 
     /// Trim the trailing ".0" so a whole-number tempo reads as "140".
     private static func format(_ value: Double) -> String {
-        value == value.rounded() ? String(Int(value)) : String(value)
+        // Int(value) traps on anything Int cannot hold, and infinity satisfies
+        // `value == value.rounded()`. `current` is whatever the slider reported,
+        // so this has to stay total even when the value is nonsense.
+        guard value.isFinite, value.magnitude < 1e15 else { return String(value) }
+        return value == value.rounded() ? String(Int(value)) : String(value)
     }
 
     private func setCycleRange(params: [String: String]) -> ChannelResult {
