@@ -51,6 +51,16 @@ struct ServerConfig: Sendable {
     /// partway to the target.
     static let tempoNudgeRetries = 3
 
+    /// Re-reads before believing the slider is against a limit. Each costs one
+    /// `tempoNudgeSettleDelay`, paid only when a nudge appears to change
+    /// nothing — which is either the 5/990 limit or a stale read.
+    static let tempoStallConfirmations = 3
+
+    /// Consecutive passes that move the slider nowhere before a pass gives up.
+    /// Each pass resolves a fresh slider, so a single AXError -25202 is worth
+    /// retrying rather than abandoning the step size for a smaller one.
+    static let tempoStuckPassLimit = 3
+
     // MARK: - Timeouts
     static let axOperationTimeout: TimeInterval = 2.0
     static let appleScriptTimeout: TimeInterval = 5.0

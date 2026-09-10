@@ -179,6 +179,10 @@ actor AccessibilityChannel: Channel {
         }
 
         var steps = 0
+        // Consecutive passes that could not move the slider at all. Reset by
+        // any pass that does, so this counts a run of failures rather than a
+        // total.
+        var stuckPasses = 0
 
         // Coarse pass: AXIncrement/AXDecrement.
         coarse: while steps < ServerConfig.tempoNudgeStepBudget {
@@ -197,19 +201,35 @@ actor AccessibilityChannel: Channel {
             case .cancelled:
                 return .error(Self.cancelledMessage(at: current))
             case .stuck:
-                break coarse
+                // Not fatal on its own. Logic Pro invalidates the slider
+                // mid-sequence (AXError -25202) and the next pass resolves a
+                // fresh one, so give that a chance. Dropping to the fine pass
+                // here instead cost a 128 -> 999 request its whole step
+                // budget: ±1 cannot cover what ±10 was covering, and it
+                // stopped 600 BPM short.
+                stuckPasses += 1
+                if stuckPasses >= ServerConfig.tempoStuckPassLimit { break coarse }
             case .moved(let next):
-                let stalled = next == current       // slider is against a limit
-                let overshot = abs(target - next) >= abs(gap)
-                current = next
+                stuckPasses = 0
+                if next == current {
+                    // Not necessarily a limit — the read may have been stale.
+                    switch await confirmStall(at: current) {
+                    case .cancelled: return .error(Self.cancelledMessage(at: current))
+                    case .atLimit:   break coarse
+                    case .moved(let settled): current = settled
+                    }
+                } else {
+                    current = next
+                }
                 // An overshooting step would ping-pong forever. Hand the
                 // remainder to the fine pass instead.
-                if stalled || overshot { break coarse }
+                if abs(target - current) >= abs(gap) { break coarse }
             }
         }
 
         // Fine pass: each write moves the slider one BPM toward the value
         // written, whatever that value is.
+        stuckPasses = 0
         fine: while steps < ServerConfig.tempoNudgeStepBudget {
             let gap = target - current
             guard abs(gap) > Self.tempoTolerance else { break fine }
@@ -221,11 +241,29 @@ actor AccessibilityChannel: Channel {
             case .cancelled:
                 return .error(Self.cancelledMessage(at: current))
             case .stuck:
-                break fine
+                stuckPasses += 1
+                if stuckPasses >= ServerConfig.tempoStuckPassLimit { break fine }
             case .moved(let next):
-                if next == current { break fine }   // at a limit
-                current = next
+                stuckPasses = 0
+                if next == current {
+                    switch await confirmStall(at: current) {
+                    case .cancelled: return .error(Self.cancelledMessage(at: current))
+                    case .atLimit:   break fine
+                    case .moved(let settled): current = settled
+                    }
+                } else {
+                    current = next
+                }
             }
+        }
+
+        // One last read from a fresh element. The value carried out of the
+        // loops is whatever the final nudge saw, and that read is exactly the
+        // one that may have been stale — reporting it would understate where
+        // the slider actually ended up.
+        if let slider = AXLogicProElements.getTempoSlider(),
+           let settled = tempoSliderValue(slider) {
+            current = settled
         }
 
         // Report what the slider actually reads, never what was asked for.
@@ -254,6 +292,43 @@ actor AccessibilityChannel: Channel {
 
     private func tempoSliderValue(_ slider: AXUIElement) -> Double? {
         (AXHelpers.getValue(slider) as? NSNumber)?.doubleValue
+    }
+
+    /// What a nudge that appeared to change nothing actually means.
+    private enum StallCheck {
+        /// The slider had moved after all; the nudge's read was stale.
+        case moved(Double)
+        /// Unchanged across every re-read: the slider is against 5 or 990.
+        case atLimit
+        case cancelled
+    }
+
+    /// Decide whether the slider really is against a limit.
+    ///
+    /// A nudge that reads back the value it started from means one of two
+    /// things: the slider cannot move any further, or the read landed before
+    /// Logic Pro published the new value. Measured on its own, the slider
+    /// reports a write within ~23ms, well inside the settle delay — but this
+    /// is not the only thing on the Accessibility actor. StatePoller walks the
+    /// track and mixer trees on the same actor, and under that contention a
+    /// stale read showed up in 1 of 3 attempts at a 120 -> 128 request. Taking
+    /// it at face value stopped the fine pass 7 BPM short, and the unverified
+    /// OSC fallback then answered "Set tempo to 128.0 BPM" for it.
+    ///
+    /// So one unchanged read is not evidence. Re-read from a fresh element
+    /// until the value moves or stays put often enough to believe.
+    private func confirmStall(at before: Double) async -> StallCheck {
+        for _ in 0..<ServerConfig.tempoStallConfirmations {
+            do {
+                try await Task.sleep(for: .seconds(ServerConfig.tempoNudgeSettleDelay))
+            } catch {
+                return .cancelled
+            }
+            guard let slider = AXLogicProElements.getTempoSlider(),
+                  let value = tempoSliderValue(slider) else { continue }
+            if value != before { return .moved(value) }
+        }
+        return .atLimit
     }
 
     private enum NudgeOutcome {
