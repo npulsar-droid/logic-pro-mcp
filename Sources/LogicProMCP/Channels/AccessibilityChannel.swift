@@ -41,7 +41,7 @@ actor AccessibilityChannel: Channel {
         case "transport.toggle_metronome":
             return toggleTransportButton(named: "Metronome")
         case "transport.set_tempo":
-            return setTempo(params: params)
+            return await setTempo(params: params)
         case "transport.set_cycle_range":
             return setCycleRange(params: params)
 
@@ -150,24 +150,164 @@ actor AccessibilityChannel: Channel {
         return .success("{\"toggled\":\"\(name)\"}")
     }
 
-    private func setTempo(params: [String: String]) -> ChannelResult {
-        guard let tempoStr = params["tempo"], let _ = Double(tempoStr) else {
-            return .error("Missing or invalid 'tempo' parameter")
+    /// Set the project tempo using the Control Bar's tempo slider.
+    ///
+    /// The slider does not accept an absolute value. Measured on Logic Pro
+    /// 12.2: with the slider reading 120, writing 140 leaves it at 121 and
+    /// writing 200 also leaves it at 121 — a write moves it exactly one BPM
+    /// toward the number written, whatever that number is. AXIncrement and
+    /// AXDecrement move it in coarser steps (10 BPM in that same build).
+    ///
+    /// So the tempo has to be converged on rather than assigned: coarse
+    /// actions while the gap is wide, single-BPM writes to land exactly, and
+    /// a readback before reporting success. Neither step size is hardcoded —
+    /// every pass re-reads the slider and stops as soon as it stops closing
+    /// the gap, so the loop still terminates if a later Logic Pro changes them.
+    private func setTempo(params: [String: String]) async -> ChannelResult {
+        // The router passes the dispatcher's params through untouched, and the
+        // dispatcher sends "bpm" — the key OSCChannel reads. This channel used
+        // to read "tempo", so the AX fallback could only ever answer "missing
+        // parameter" and no set_tempo ever reached the slider. Accept both.
+        guard let target = Self.parseTempo(params) else {
+            return .error("Missing or invalid '\(ChannelParam.tempo)' parameter")
         }
-        guard let transport = AXLogicProElements.getTransportBar() else {
-            return .error("Cannot locate transport bar")
+        guard let slider = AXLogicProElements.getTempoSlider() else {
+            return .error("Cannot locate the tempo slider in the Control Bar")
         }
-        // Find the tempo text field and set its value
-        let texts = AXHelpers.findAllDescendants(of: transport, role: kAXTextFieldRole, maxDepth: 4)
-        for field in texts {
-            let desc = AXHelpers.getDescription(field)?.lowercased() ?? ""
-            if desc.contains("tempo") || desc.contains("bpm") {
-                AXHelpers.setAttribute(field, kAXValueAttribute, tempoStr as CFTypeRef)
-                AXHelpers.performAction(field, kAXConfirmAction)
-                return .success("{\"tempo\":\(tempoStr)}")
+        guard var current = tempoSliderValue(slider) else {
+            return .error("Cannot read the current tempo")
+        }
+
+        var steps = 0
+
+        // Coarse pass: AXIncrement/AXDecrement.
+        coarse: while steps < ServerConfig.tempoNudgeStepBudget {
+            let gap = target - current
+            guard abs(gap) > Self.tempoTolerance else { break coarse }
+            // Re-resolve the slider every pass. Logic Pro invalidates the
+            // element partway through a long nudge sequence — AXError -25202,
+            // kAXErrorInvalidUIElement — and a held reference would strand the
+            // tempo wherever it happened to be, then report that as a failure.
+            guard let slider = AXLogicProElements.getTempoSlider() else { break coarse }
+            let action = gap > 0 ? kAXIncrementAction : kAXDecrementAction
+            steps += 1
+            switch await nudgeTempo(slider, apply: {
+                AXHelpers.performActionResult(slider, action)
+            }) {
+            case .cancelled:
+                return .error(Self.cancelledMessage(at: current))
+            case .stuck:
+                break coarse
+            case .moved(let next):
+                let stalled = next == current       // slider is against a limit
+                let overshot = abs(target - next) >= abs(gap)
+                current = next
+                // An overshooting step would ping-pong forever. Hand the
+                // remainder to the fine pass instead.
+                if stalled || overshot { break coarse }
             }
         }
-        return .error("Cannot locate tempo field")
+
+        // Fine pass: each write moves the slider one BPM toward the value
+        // written, whatever that value is.
+        fine: while steps < ServerConfig.tempoNudgeStepBudget {
+            let gap = target - current
+            guard abs(gap) > Self.tempoTolerance else { break fine }
+            guard let slider = AXLogicProElements.getTempoSlider() else { break fine }
+            steps += 1
+            switch await nudgeTempo(slider, apply: {
+                AXHelpers.setAttributeResult(slider, kAXValueAttribute, NSNumber(value: target))
+            }) {
+            case .cancelled:
+                return .error(Self.cancelledMessage(at: current))
+            case .stuck:
+                break fine
+            case .moved(let next):
+                if next == current { break fine }   // at a limit
+                current = next
+            }
+        }
+
+        // Report what the slider actually reads, never what was asked for.
+        guard abs(target - current) <= Self.tempoTolerance else {
+            return .error(
+                "Tempo did not reach \(Self.format(target)) BPM; the slider stopped at "
+                + "\(Self.format(current)) BPM after \(steps) step(s)"
+            )
+        }
+        return .success("{\"tempo\":\(Self.format(current))}")
+    }
+
+    /// Read the target tempo out of the params the router forwarded.
+    ///
+    /// Accepts "tempo" as well as the canonical key so a caller that predates
+    /// `ChannelParam` still reaches the slider. Not private: the tests pin the
+    /// dispatcher's key to the one this channel reads, which is the check that
+    /// would have caught the original mismatch.
+    static func parseTempo(_ params: [String: String]) -> Double? {
+        guard let raw = params[ChannelParam.tempo] ?? params["tempo"] else { return nil }
+        return Double(raw)
+    }
+
+    /// Half a BPM: the slider reports whole numbers, so anything closer than
+    /// this is the same tempo.
+    private static let tempoTolerance = 0.5
+
+    private func tempoSliderValue(_ slider: AXUIElement) -> Double? {
+        (AXHelpers.getValue(slider) as? NSNumber)?.doubleValue
+    }
+
+    private enum NudgeOutcome {
+        case moved(Double)
+        /// AX kept refusing, or the slider would not budge.
+        case stuck
+        case cancelled
+    }
+
+    /// Apply one nudge and report where the slider settled.
+    ///
+    /// Retries, because this is not the only thing using the Accessibility
+    /// actor: StatePoller reads transport state on its own schedule, and its
+    /// reads land in the `await` gaps between nudges. Logic Pro intermittently
+    /// refuses a nudge while it is servicing those, and treating the first
+    /// refusal as fatal left the tempo stranded partway to the target. The
+    /// caller re-resolves the slider between passes, so a retry here also
+    /// gets a fresh element rather than re-poking an invalidated one.
+    private func nudgeTempo(
+        _ slider: AXUIElement, apply: () -> AXError
+    ) async -> NudgeOutcome {
+        var lastError = AXError.success
+        for attempt in 0..<ServerConfig.tempoNudgeRetries {
+            lastError = apply()
+            // Back off between attempts, so a retry does not arrive while
+            // Logic Pro is still busy with whatever refused the last one.
+            let settle = ServerConfig.tempoNudgeSettleDelay * Double(attempt + 1)
+            do {
+                try await Task.sleep(for: .seconds(settle))
+            } catch {
+                // `try?` here would swallow cancellation and keep nudging a
+                // slider nobody is waiting on any more.
+                return .cancelled
+            }
+            if lastError == .success, let value = tempoSliderValue(slider) {
+                return .moved(value)
+            }
+        }
+        Log.debug(
+            "Tempo nudge gave up after \(ServerConfig.tempoNudgeRetries) attempts, "
+            + "last AXError \(lastError.rawValue)",
+            subsystem: "ax"
+        )
+        return .stuck
+    }
+
+    private static func cancelledMessage(at tempo: Double) -> String {
+        "Cancelled while setting the tempo; it now reads \(format(tempo)) BPM"
+    }
+
+    /// Trim the trailing ".0" so a whole-number tempo reads as "140".
+    private static func format(_ value: Double) -> String {
+        value == value.rounded() ? String(Int(value)) : String(value)
     }
 
     private func setCycleRange(params: [String: String]) -> ChannelResult {

@@ -40,6 +40,20 @@ enum AXHelpers {
         return result
     }
 
+    /// Set an attribute, returning the AX error rather than a Bool.
+    /// Callers that retry need to tell a refusal apart from a transient
+    /// kAXErrorCannotComplete, which Logic Pro returns while it is busy.
+    static func setAttributeResult(
+        _ element: AXUIElement, _ attribute: String, _ value: CFTypeRef
+    ) -> AXError {
+        AXUIElementSetAttributeValue(element, attribute as CFString, value)
+    }
+
+    /// Perform an action, returning the AX error rather than a Bool.
+    static func performActionResult(_ element: AXUIElement, _ action: String) -> AXError {
+        AXUIElementPerformAction(element, action as CFString)
+    }
+
     /// Perform a named action on an AX element (e.g. kAXPressAction).
     /// Returns true on success.
     @discardableResult

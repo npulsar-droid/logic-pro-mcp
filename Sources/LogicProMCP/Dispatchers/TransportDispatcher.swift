@@ -89,7 +89,7 @@ struct TransportDispatcher {
             }
             let result = await router.route(
                 operation: "transport.set_tempo",
-                params: ["bpm": String(tempo)]
+                params: [ChannelParam.tempo: String(tempo)]
             )
             return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
 

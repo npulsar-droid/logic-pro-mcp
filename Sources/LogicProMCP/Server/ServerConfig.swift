@@ -36,6 +36,21 @@ struct ServerConfig: Sendable {
     /// Delay after a mutation before re-reading state via AX
     static let verifyAfterWriteDelay: TimeInterval = 0.15
 
+    // MARK: - Tempo Slider
+    /// Logic Pro's tempo slider takes only relative steps, so setting a tempo
+    /// means nudging it until it reads the target. How long to let one nudge
+    /// land before re-reading the slider.
+    static let tempoNudgeSettleDelay: TimeInterval = 0.06
+    /// Upper bound on nudges for a single set_tempo. Coarse steps cover the
+    /// slider's 5-990 range in about a hundred moves; this only stops a
+    /// runaway loop if a future Logic Pro changes the step size.
+    static let tempoNudgeStepBudget = 200
+    /// Attempts per nudge. The state poller shares the Accessibility actor and
+    /// its reads land between nudges, so Logic Pro intermittently answers
+    /// kAXErrorCannotComplete. Giving up on the first one strands the tempo
+    /// partway to the target.
+    static let tempoNudgeRetries = 3
+
     // MARK: - Timeouts
     static let axOperationTimeout: TimeInterval = 2.0
     static let appleScriptTimeout: TimeInterval = 5.0

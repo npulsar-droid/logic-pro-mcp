@@ -59,6 +59,19 @@ enum AXLogicProElements {
         return nil
     }
 
+    /// The Control Bar's tempo control.
+    ///
+    /// Logic Pro exposes it as an AXSlider described "Tempo". There is no
+    /// editable text field for the tempo anywhere in the AX tree, so a
+    /// text-field lookup finds nothing and set_tempo can only go through
+    /// this element.
+    static func getTempoSlider() -> AXUIElement? {
+        guard let transport = getTransportBar() else { return nil }
+        return AXHelpers.findDescendant(
+            of: transport, role: kAXSliderRole, description: "Tempo", maxDepth: 4
+        )
+    }
+
     // MARK: - Tracks
 
     /// Find the track header area containing individual track rows.

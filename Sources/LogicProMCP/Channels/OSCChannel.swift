@@ -71,7 +71,7 @@ actor OSCChannel: Channel {
         // MARK: - Transport
 
         case "transport.set_tempo":
-            guard let tempo = params["bpm"].flatMap(Float.init) else {
+            guard let tempo = params[ChannelParam.tempo].flatMap(Float.init) else {
                 return .error("set_tempo requires 'bpm' (float)")
             }
             let msg = OSCMessage(address: "/tempo", arguments: [.float(tempo)])
@@ -137,10 +137,19 @@ actor OSCChannel: Channel {
 
     // MARK: - Private
 
+    /// Send one OSC message.
+    ///
+    /// OSC here is UDP, and Logic Pro only listens at all once the user has
+    /// added a Logic Control surface pointing at this port. A datagram sent
+    /// into a port nobody is bound to still "succeeds" — the send call cannot
+    /// tell the two cases apart — so this reports .unverified, the same way
+    /// CGEventChannel and CoreMIDIChannel already report their own writes.
+    /// Reporting .success here is what let set_tempo answer "Set tempo to
+    /// 140.0 BPM" while Logic Pro stayed at 120.
     private func send(_ message: OSCMessage, description: String) async -> ChannelResult {
         do {
             try await client.send(message: message)
-            return .success(description)
+            return .unverified("\(description) (sent via OSC; Logic delivery is not verified)")
         } catch {
             Log.error("OSC send failed: \(error)", subsystem: "osc")
             return .error("OSC send failed: \(error.localizedDescription)")
