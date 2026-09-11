@@ -11,10 +11,34 @@ enum AXLogicProElements {
         return AXHelpers.axApp(pid: pid)
     }
 
-    /// Get the main window element.
+    /// Get the window every element lookup starts from.
+    ///
+    /// `AXMainWindow` is the right answer when there is one, but Logic Pro
+    /// stops publishing it once the app is no longer active: the attribute
+    /// answers kAXErrorNoValue (-25212) and the project window reports
+    /// `AXMain = false`, while `AXWindows` still lists it perfectly well.
+    /// Every element finder in this file goes through here, so returning nil
+    /// in that state takes the whole Accessibility channel down — and because
+    /// the router falls through to a channel that cannot verify anything,
+    /// `set_tempo` then answers "sent via OSC" while the tempo never moves.
+    /// Logic Pro not being frontmost is the normal case for a background
+    /// server, so fall back rather than give up.
     static func mainWindow() -> AXUIElement? {
         guard let app = appRoot() else { return nil }
-        return AXHelpers.getAttribute(app, kAXMainWindowAttribute)
+        if let main: AXUIElement = AXHelpers.getAttribute(app, kAXMainWindowAttribute) {
+            return main
+        }
+        if let focused: AXUIElement = AXHelpers.getAttribute(app, kAXFocusedWindowAttribute) {
+            return focused
+        }
+        // Last resort: the first ordinary window. Plugin editors and the like
+        // carry other subroles, so this does not wander off into one of those.
+        // With several projects open it may pick the wrong one, which is still
+        // better than the alternative of reaching nothing at all.
+        let windows: [AXUIElement] = AXHelpers.getAttribute(app, kAXWindowsAttribute) ?? []
+        return windows.first {
+            AXHelpers.getSubrole($0) == (kAXStandardWindowSubrole as String)
+        }
     }
 
     // MARK: - Transport

@@ -72,6 +72,12 @@ enum AXHelpers {
         getAttribute(element, kAXTitleAttribute)
     }
 
+    /// Subrole, e.g. AXStandardWindow. Distinguishes a project window from a
+    /// plugin editor or a dialog, which share the AXWindow role.
+    static func getSubrole(_ element: AXUIElement) -> String? {
+        getAttribute(element, kAXSubroleAttribute)
+    }
+
     /// Get the identifier of an element.
     static func getIdentifier(_ element: AXUIElement) -> String? {
         getAttribute(element, kAXIdentifierAttribute)
