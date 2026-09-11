@@ -1,5 +1,6 @@
 import XCTest
 @testable import LogicProMCP
+import MCP
 
 /// set_tempo crosses three files that each had their own idea of the parameter
 /// name: the dispatcher wrote "bpm", OSCChannel read "bpm", AccessibilityChannel
@@ -132,6 +133,7 @@ final class SetTempoContractTests: XCTestCase {
 private actor StubChannel: Channel {
     nonisolated let id: ChannelID
     private let result: ChannelResult
+    private(set) var calls = 0
 
     init(id: ChannelID, result: ChannelResult) {
         self.id = id
@@ -142,6 +144,42 @@ private actor StubChannel: Channel {
     func stop() async {}
     func healthCheck() async -> ChannelHealth { .healthy() }
     func execute(operation: String, params: [String: String]) async -> ChannelResult {
-        result
+        calls += 1
+        return result
+    }
+}
+
+/// A set_tempo that arrives without a tempo must not touch the project.
+///
+/// It used to default to 120. Observed from the user's side as the project
+/// tempo "going to 120 a lot": a caller that put `tempo` next to `command`
+/// rather than inside `params` got a successful reset to 120 every time.
+final class SetTempoMissingTempoTests: XCTestCase {
+    private func dispatch(_ params: [String: Value]) async -> (CallTool.Result, Int) {
+        let router = ChannelRouter()
+        let channel = StubChannel(id: .accessibility, result: .success("{\"tempo\":120}"))
+        await router.register(channel)
+        let result = await TransportDispatcher.handle(
+            command: "set_tempo", params: params, router: router, cache: StateCache()
+        )
+        return (result, await channel.calls)
+    }
+
+    func testMissingTempoIsAnErrorAndReachesNoChannel() async {
+        let (result, calls) = await dispatch([:])
+        XCTAssertEqual(result.isError, true)
+        XCTAssertEqual(calls, 0, "a request without a tempo still reached a channel")
+    }
+
+    /// The error has to say where the tempo goes, or a caller that made the
+    /// mistake once will make it again on the retry.
+    func testMissingTempoMessageShowsTheParamsShape() {
+        XCTAssertTrue(TransportDispatcher.missingTempoMessage.contains(#""params": {"tempo""#))
+    }
+
+    func testTempoInsideParamsStillReachesTheChannel() async {
+        let (result, calls) = await dispatch(["tempo": .double(128)])
+        XCTAssertNotEqual(result.isError, true)
+        XCTAssertEqual(calls, 1)
     }
 }

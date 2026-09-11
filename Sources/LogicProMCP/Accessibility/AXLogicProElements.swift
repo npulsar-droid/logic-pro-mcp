@@ -28,17 +28,26 @@ enum AXLogicProElements {
         if let main: AXUIElement = AXHelpers.getAttribute(app, kAXMainWindowAttribute) {
             return main
         }
-        if let focused: AXUIElement = AXHelpers.getAttribute(app, kAXFocusedWindowAttribute) {
+        // The focused window only counts if it is a project window. Logic Pro
+        // raises alerts on its own — "The last selected audio interface is not
+        // available" appears at launch whenever an interface is unplugged — and
+        // an alert takes focus with subrole AXDialog. Taking it at its word
+        // sent every lookup into a window with two labels and two buttons, and
+        // set_tempo answered "sent via OSC" for a tempo that never moved.
+        if let focused: AXUIElement = AXHelpers.getAttribute(app, kAXFocusedWindowAttribute),
+           isProjectWindow(focused) {
             return focused
         }
-        // Last resort: the first ordinary window. Plugin editors and the like
-        // carry other subroles, so this does not wander off into one of those.
-        // With several projects open it may pick the wrong one, which is still
-        // better than the alternative of reaching nothing at all.
+        // Last resort: the first ordinary window. With several projects open it
+        // may pick the wrong one, which is still better than reaching nothing.
         let windows: [AXUIElement] = AXHelpers.getAttribute(app, kAXWindowsAttribute) ?? []
-        return windows.first {
-            AXHelpers.getSubrole($0) == (kAXStandardWindowSubrole as String)
-        }
+        return windows.first(where: isProjectWindow)
+    }
+
+    /// Whether a window can hold the Control Bar and the track area.
+    /// Alerts and sheets report AXDialog (measured on Logic Pro 12.2).
+    private static func isProjectWindow(_ window: AXUIElement) -> Bool {
+        AXHelpers.getSubrole(window) == (kAXStandardWindowSubrole as String)
     }
 
     // MARK: - Transport
