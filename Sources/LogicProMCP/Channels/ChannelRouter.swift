@@ -218,6 +218,14 @@ actor ChannelRouter {
             case .error(let msg):
                 Log.debug("\(operation) failed via \(channelID.rawValue): \(msg), trying next", subsystem: "router")
                 lastError = msg
+            case .terminal(let msg):
+                // The channel knows the answer. Every channel below it is a
+                // weaker way to do the same thing — for set_tempo, one that
+                // cannot read the tempo back at all — so falling through
+                // would replace a known failure with an unverifiable claim
+                // of success.
+                Log.debug("\(operation) answered conclusively by \(channelID.rawValue): \(msg), not trying others", subsystem: "router")
+                return result
             }
         }
 

@@ -7,6 +7,14 @@ import Foundation
 actor AccessibilityChannel: Channel {
     let id: ChannelID = .accessibility
 
+    /// Set while a tempo change is converging.
+    ///
+    /// This is an actor, but every nudge suspends, and a second set_tempo
+    /// arriving in one of those gaps would interleave with the first: each
+    /// would read the other's nudges as its own progress, and neither would
+    /// land where it was asked to. Only one at a time.
+    private var tempoChangeInFlight = false
+
     func start() async throws {
         // Verify AX trust. If not trusted, the process needs to be added to
         // System Preferences > Privacy & Security > Accessibility.
@@ -178,81 +186,96 @@ actor AccessibilityChannel: Channel {
             return .error("Cannot read the current tempo")
         }
 
+        // Reject rather than queue. A caller that asked twice wants to know
+        // that, and telling it where the slider actually is beats making it
+        // wait out a convergence it did not ask for.
+        //
+        // Nothing above this line suspends, so no second request can slip in
+        // between entering the actor and the flag going up. Keep it that way:
+        // an `await` added above would open exactly the window this closes.
+        guard !tempoChangeInFlight else {
+            return .terminal(
+                "A tempo change is already running; the slider reads "
+                + "\(Self.format(current)) BPM"
+            )
+        }
+        tempoChangeInFlight = true
+        defer { tempoChangeInFlight = false }
+
+        // The step budget bounds nudges, not time: a slider that answers
+        // slowly, or a pass that keeps retrying, can hold the request far
+        // longer than any caller expects. Bound the wall clock too.
+        let clock = ContinuousClock()
+        let started = clock.now
+        let expiry = started.advanced(by: .seconds(ServerConfig.tempoConvergenceDeadline))
+        var expired = false
+
         var steps = 0
         // Consecutive passes that could not move the slider at all. Reset by
         // any pass that does, so this counts a run of failures rather than a
         // total.
         var stuckPasses = 0
+        // Cleared if a coarse step ever widens the gap. Measured, the coarse
+        // step is 10 BPM and the loop only reaches for it when at least that
+        // much is left, so this should not fire — but a Logic Pro that steps
+        // by more than the gap would otherwise ping-pong forever.
+        var coarseUsable = true
 
-        // Coarse pass: AXIncrement/AXDecrement.
-        coarse: while steps < ServerConfig.tempoNudgeStepBudget {
+        // One loop, with the step size taken from the gap that is left.
+        //
+        // This used to be two passes, coarse then fine, and a pass could only
+        // be left for good. Three consecutive AXError -25202 in the coarse
+        // pass — routine on this slider — dropped a full-span move into ±1
+        // writes permanently, and 200 steps of ±1 cannot cover 970 BPM: a
+        // 990 -> 20 request stopped at 763 and a 140 -> 990 at 367, both
+        // exactly 227 BPM in, both out of budget. Choosing per step means a
+        // stuck pass costs one step, not the step size.
+        converge: while steps < ServerConfig.tempoNudgeStepBudget {
             let gap = target - current
-            guard abs(gap) > Self.tempoTolerance else { break coarse }
+            guard abs(gap) > Self.tempoTolerance else { break converge }
+            guard clock.now < expiry else { expired = true; break converge }
             // Re-resolve the slider every pass. Logic Pro invalidates the
             // element partway through a long nudge sequence — AXError -25202,
             // kAXErrorInvalidUIElement — and a held reference would strand the
             // tempo wherever it happened to be, then report that as a failure.
-            guard let slider = AXLogicProElements.getTempoSlider() else { break coarse }
-            let action = gap > 0 ? kAXIncrementAction : kAXDecrementAction
+            guard let slider = AXLogicProElements.getTempoSlider() else { break converge }
+
+            // AXIncrement/AXDecrement move 10 BPM; writing AXValue moves 1
+            // toward whatever was written. Both measured against Logic Pro
+            // 12.2 — neither is documented.
+            let useCoarse = coarseUsable && abs(gap) >= Self.coarseNudgeStep
             steps += 1
             switch await nudgeTempo(slider, apply: {
-                AXHelpers.performActionResult(slider, action)
+                if useCoarse {
+                    return AXHelpers.performActionResult(
+                        slider, gap > 0 ? kAXIncrementAction : kAXDecrementAction
+                    )
+                }
+                return AXHelpers.setAttributeResult(
+                    slider, kAXValueAttribute, NSNumber(value: target)
+                )
             }) {
             case .cancelled:
-                return .error(Self.cancelledMessage(at: current))
+                return .terminal(Self.cancelledMessage(at: current))
             case .stuck:
-                // Not fatal on its own. Logic Pro invalidates the slider
-                // mid-sequence (AXError -25202) and the next pass resolves a
-                // fresh one, so give that a chance. Dropping to the fine pass
-                // here instead cost a 128 -> 999 request its whole step
-                // budget: ±1 cannot cover what ±10 was covering, and it
-                // stopped 600 BPM short.
+                // Not fatal on its own: the next pass resolves a fresh
+                // element, which is usually all -25202 needs.
                 stuckPasses += 1
-                if stuckPasses >= ServerConfig.tempoStuckPassLimit { break coarse }
+                if stuckPasses >= ServerConfig.tempoStuckPassLimit { break converge }
             case .moved(let next):
                 stuckPasses = 0
                 if next == current {
                     // Not necessarily a limit — the read may have been stale.
                     switch await confirmStall(at: current) {
-                    case .cancelled: return .error(Self.cancelledMessage(at: current))
-                    case .atLimit:   break coarse
+                    case .cancelled: return .terminal(Self.cancelledMessage(at: current))
+                    case .atLimit:   break converge
                     case .moved(let settled): current = settled
                     }
                 } else {
                     current = next
                 }
-                // An overshooting step would ping-pong forever. Hand the
-                // remainder to the fine pass instead.
-                if abs(target - current) >= abs(gap) { break coarse }
-            }
-        }
-
-        // Fine pass: each write moves the slider one BPM toward the value
-        // written, whatever that value is.
-        stuckPasses = 0
-        fine: while steps < ServerConfig.tempoNudgeStepBudget {
-            let gap = target - current
-            guard abs(gap) > Self.tempoTolerance else { break fine }
-            guard let slider = AXLogicProElements.getTempoSlider() else { break fine }
-            steps += 1
-            switch await nudgeTempo(slider, apply: {
-                AXHelpers.setAttributeResult(slider, kAXValueAttribute, NSNumber(value: target))
-            }) {
-            case .cancelled:
-                return .error(Self.cancelledMessage(at: current))
-            case .stuck:
-                stuckPasses += 1
-                if stuckPasses >= ServerConfig.tempoStuckPassLimit { break fine }
-            case .moved(let next):
-                stuckPasses = 0
-                if next == current {
-                    switch await confirmStall(at: current) {
-                    case .cancelled: return .error(Self.cancelledMessage(at: current))
-                    case .atLimit:   break fine
-                    case .moved(let settled): current = settled
-                    }
-                } else {
-                    current = next
+                if useCoarse && abs(target - current) >= abs(gap) {
+                    coarseUsable = false
                 }
             }
         }
@@ -268,8 +291,14 @@ actor AccessibilityChannel: Channel {
 
         // Report what the slider actually reads, never what was asked for.
         guard abs(target - current) <= Self.tempoTolerance else {
-            return .error(
-                "Tempo did not reach \(Self.format(target)) BPM; the slider stopped at "
+            let limit = expired
+                ? " within \(Self.seconds(clock.now - started))"
+                : ""
+            // Terminal, not .error: the slider was read back, so this is a
+            // measured failure. A channel that cannot read the tempo has
+            // nothing to add except a success it cannot stand behind.
+            return .terminal(
+                "Tempo did not reach \(Self.format(target)) BPM\(limit); the slider stopped at "
                 + "\(Self.format(current)) BPM after \(steps) step(s)"
             )
         }
@@ -289,6 +318,11 @@ actor AccessibilityChannel: Channel {
     /// Half a BPM: the slider reports whole numbers, so anything closer than
     /// this is the same tempo.
     private static let tempoTolerance = 0.5
+
+    /// How far AXIncrement/AXDecrement move the tempo slider, measured against
+    /// Logic Pro 12.2. Below this much remaining gap, a coarse step would
+    /// overshoot and the loop writes AXValue for ±1 instead.
+    private static let coarseNudgeStep: Double = 10
 
     private func tempoSliderValue(_ slider: AXUIElement) -> Double? {
         (AXHelpers.getValue(slider) as? NSNumber)?.doubleValue
@@ -377,6 +411,13 @@ actor AccessibilityChannel: Channel {
 
     private static func cancelledMessage(at tempo: Double) -> String {
         "Cancelled while setting the tempo; it now reads \(format(tempo)) BPM"
+    }
+
+    /// Elapsed time for a failure message, e.g. "15.0s".
+    private static func seconds(_ elapsed: Duration) -> String {
+        let value = Double(elapsed.components.seconds)
+            + Double(elapsed.components.attoseconds) / 1e18
+        return String(format: "%.1fs", value)
     }
 
     /// Trim the trailing ".0" so a whole-number tempo reads as "140".

@@ -61,6 +61,14 @@ struct ServerConfig: Sendable {
     /// retrying rather than abandoning the step size for a smaller one.
     static let tempoStuckPassLimit = 3
 
+    /// Wall-clock bound on one tempo change. Measured against Logic Pro 12.2,
+    /// the full span of the slider — 20 to 990 or back — takes 6.2 to 6.7
+    /// seconds, so this leaves better than double the headroom while still
+    /// bounding a request that would otherwise run on the step budget alone.
+    /// `axOperationTimeout` is deliberately not reused: at 2 seconds it is
+    /// sized for a single AX call and would cut legitimate large moves short.
+    static let tempoConvergenceDeadline: TimeInterval = 15
+
     // MARK: - Timeouts
     static let axOperationTimeout: TimeInterval = 2.0
     static let appleScriptTimeout: TimeInterval = 5.0

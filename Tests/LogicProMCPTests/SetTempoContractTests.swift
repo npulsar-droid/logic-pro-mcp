@@ -68,4 +68,80 @@ final class SetTempoContractTests: XCTestCase {
         XCTAssertEqual(chain.first, .accessibility, "chain was \(chain)")
         XCTAssertTrue(chain.contains(.osc), "OSC should remain as a fallback")
     }
+
+    /// Measured against Logic Pro 12.2: walking the slider the full 20-990 span
+    /// takes 6.2 to 6.7 seconds. A deadline at or under that would abort moves
+    /// that were about to succeed and report them as failures, so pin the floor.
+    func testTempoDeadlineClearsTheMeasuredWorstCase() {
+        XCTAssertGreaterThan(ServerConfig.tempoConvergenceDeadline, 7)
+    }
+
+    /// The deadline exists to bound a stuck request. Reusing the single-call
+    /// AX timeout (2s) here was the tempting wrong answer; this fails if
+    /// someone collapses the two.
+    func testTempoDeadlineIsNotTheSingleCallTimeout() {
+        XCTAssertNotEqual(
+            ServerConfig.tempoConvergenceDeadline,
+            ServerConfig.axOperationTimeout
+        )
+    }
+
+    /// A conclusive failure is not a success. The dispatchers turn `isSuccess`
+    /// straight into the MCP `isError` flag, so getting this wrong tells the
+    /// caller the tempo changed when the channel reported that it did not.
+    func testTerminalResultIsNotASuccess() {
+        XCTAssertFalse(ChannelResult.terminal("busy").isSuccess)
+        XCTAssertEqual(ChannelResult.terminal("busy").message, "busy")
+    }
+
+    /// The router must stop on a conclusive answer instead of falling through.
+    ///
+    /// Observed live before this was added: the Accessibility channel refused
+    /// an overlapping set_tempo, the router read that as "channel failed" and
+    /// tried OSC, and OSC — which cannot read the tempo back — answered "Set
+    /// tempo to 300.0 BPM (sent via OSC)" while the slider sat at 200. The
+    /// same laundering happened when the convergence loop ran out of budget.
+    func testRouterStopsOnATerminalResultInsteadOfFallingThroughToOSC() async {
+        let router = ChannelRouter()
+        await router.register(StubChannel(id: .accessibility, result: .terminal("busy")))
+        await router.register(StubChannel(id: .osc, result: .unverified("sent via OSC")))
+
+        let result = await router.route(operation: "transport.set_tempo", params: [:])
+
+        XCTAssertFalse(result.isSuccess, "a refusal must not read as success")
+        XCTAssertEqual(result.message, "busy", "the OSC answer leaked through")
+    }
+
+    /// The counterpart: a plain failure still falls through, so the terminal
+    /// case above is doing something a `.error` would not have done. A channel
+    /// that could not even try — no Accessibility permission, no slider — has
+    /// no information to protect, and the fallback is worth having.
+    func testRouterStillFallsThroughOnAPlainError() async {
+        let router = ChannelRouter()
+        await router.register(StubChannel(id: .accessibility, result: .error("no slider")))
+        await router.register(StubChannel(id: .osc, result: .unverified("sent via OSC")))
+
+        let result = await router.route(operation: "transport.set_tempo", params: [:])
+
+        XCTAssertEqual(result.message, "sent via OSC")
+    }
+}
+
+/// Answers one canned result, so a routing test needs neither Logic Pro nor
+/// Accessibility permission.
+private actor StubChannel: Channel {
+    nonisolated let id: ChannelID
+    private let result: ChannelResult
+
+    init(id: ChannelID, result: ChannelResult) {
+        self.id = id
+        self.result = result
+    }
+
+    func start() async throws {}
+    func stop() async {}
+    func healthCheck() async -> ChannelHealth { .healthy() }
+    func execute(operation: String, params: [String: String]) async -> ChannelResult {
+        result
+    }
 }
